@@ -23,6 +23,7 @@ type Image struct {
 	Config          *runconfig.Config `json:"config,omitempty"`
 	Architecture    string            `json:"architecture,omitempty"`
 	OS              string            `json:"os,omitempty"`
+	Root            string
 	Size            int64
 }
 

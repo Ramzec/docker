@@ -76,6 +76,7 @@ func (r *retainedLayers) Exists(layerID string) bool {
 // A Graph is a store for versioned filesystem images and the relationship between them.
 type Graph struct {
 	root       string
+	rootNFS    string // The NFS root of "/var/lib/docker/graph" from remote hosts
 	idIndex    *truncindex.TruncIndex
 	driver     graphdriver.Driver
 	imageMutex imageMutex // protect images in driver.
@@ -103,6 +104,7 @@ func NewGraph(root string, driver graphdriver.Driver) (*Graph, error) {
 
 	graph := &Graph{
 		root:     abspath,
+		rootNFS:  "/opt/docker-graphs-nfs-root", // FIXME: This should be configurable
 		idIndex:  truncindex.NewTruncIndex([]string{}),
 		driver:   driver,
 		retained: &retainedLayers{layerHolders: make(map[string]map[string]struct{})},
@@ -118,10 +120,10 @@ func (graph *Graph) IsHeld(layerID string) bool {
 	return graph.retained.Exists(layerID)
 }
 
-func (graph *Graph) restore() error {
-	dir, err := ioutil.ReadDir(graph.root)
+func (graph *Graph) restoreImpl(root string) ([]string, error) {
+	dir, err := ioutil.ReadDir(root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var ids = []string{}
 	for _, v := range dir {
@@ -129,6 +131,33 @@ func (graph *Graph) restore() error {
 		if graph.driver.Exists(id) {
 			ids = append(ids, id)
 		}
+	}
+
+	return ids, nil
+}
+
+func (graph *Graph) restore() error {
+	ids, err := graph.restoreImpl(graph.root)
+	if err != nil {
+		return err
+	}
+
+	dir, err := ioutil.ReadDir(graph.rootNFS)
+	if err != nil {
+		fmt.Printf("Unable to read Graph NFS Root '%s'", graph.rootNFS)
+		return err
+	}
+
+	// Read the mountpoins of remote graphs
+	for _, d := range dir {
+		path := filepath.Join(graph.rootNFS, d.Name())
+		idsTmp, err := graph.restoreImpl(path)
+		if err != nil {
+			fmt.Printf("Unable to restore from '%s'", path)
+			continue
+		}
+
+		ids = append(ids, idsTmp...)
 	}
 
 	baseIds, err := graph.restoreBaseImages()
@@ -163,6 +192,7 @@ func (graph *Graph) Get(name string) (*image.Image, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not find image: %v", err)
 	}
+
 	img, err := graph.loadImage(id)
 	if err != nil {
 		return nil, err
@@ -178,7 +208,7 @@ func (graph *Graph) Get(name string) (*image.Image, error) {
 		}
 
 		img.Size = size
-		if err := graph.saveSize(graph.imageRoot(id), int(img.Size)); err != nil {
+		if err := graph.saveSize(img.Root, int(img.Size)); err != nil {
 			return nil, err
 		}
 	}
@@ -237,10 +267,13 @@ func (graph *Graph) Register(img *image.Image, layerData archive.ArchiveReader) 
 		return fmt.Errorf("Image %s already exists", img.ID)
 	}
 
+	img.Root = graph.constructImageRoot(img.ID)
+
 	// Ensure that the image root does not exist on the filesystem
 	// when it is not registered in the graph.
 	// This is common when you switch from one graph driver to another
-	if err := os.RemoveAll(graph.imageRoot(img.ID)); err != nil && !os.IsNotExist(err) {
+
+	if err := os.RemoveAll(img.Root); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
@@ -266,7 +299,7 @@ func (graph *Graph) Register(img *image.Image, layerData archive.ArchiveReader) 
 		return err
 	}
 	// Commit
-	if err := os.Rename(tmp, graph.imageRoot(img.ID)); err != nil {
+	if err := os.Rename(tmp, img.Root); err != nil {
 		return err
 	}
 	graph.idIndex.Add(img.ID)
@@ -345,17 +378,18 @@ func (graph *Graph) Delete(name string) error {
 	if err != nil {
 		return err
 	}
+	imageRoot := graph.constructImageRoot(id)
 	tmp, err := graph.mktemp("")
 	graph.idIndex.Delete(id)
 	if err == nil {
-		if err := os.Rename(graph.imageRoot(id), tmp); err != nil {
+		if err := os.Rename(imageRoot, tmp); err != nil {
 			// On err make tmp point to old dir and cleanup unused tmp dir
 			os.RemoveAll(tmp)
-			tmp = graph.imageRoot(id)
+			tmp = imageRoot
 		}
 	} else {
 		// On err make tmp point to old dir for cleanup
-		tmp = graph.imageRoot(id)
+		tmp = imageRoot
 	}
 	// Remove rootfs data from the driver
 	graph.driver.Remove(id)
@@ -372,15 +406,64 @@ func (graph *Graph) Map() map[string]*image.Image {
 	return images
 }
 
+func (graph *Graph) walkOneImpl(root string, handler func(string, string)) error {
+	files, err := ioutil.ReadDir(root)
+	if err != nil {
+		fmt.Printf("Unable to ReadDir() for '%s'\n", root)
+		return err
+	}
+
+	for _, st := range files {
+		if st.Name() == "_tmp" {
+			continue
+		}
+
+		if handler != nil {
+			handler(root, st.Name())
+		}
+	}
+
+	return nil
+}
+
+// FIXME: graph.idIndex is not updated if an
+// image created/destroyed at a remote host
+func (graph *Graph) walkAllImpl(handler func(string, string)) error {
+	// First iterate over the local graph
+	graph.idIndex.Iterate(func(id string) {
+		handler(graph.root, id)
+	})
+
+	// Second iterate over the remote graphs
+	dirs, err := ioutil.ReadDir(graph.rootNFS)
+	if err != nil {
+		fmt.Printf("Unable to read Graph NFS Root '%s'\n", graph.rootNFS)
+		return err
+	}
+
+	// Read the mountpoins of remote graphs
+	for _, d := range dirs {
+		path := filepath.Join(graph.rootNFS, d.Name())
+		err := graph.walkOneImpl(path, handler)
+		if err != nil {
+			fmt.Printf("Unable to walk over '%s'\n", path)
+			continue
+		}
+	}
+
+	return nil
+}
+
 // walkAll iterates over each image in the graph, and passes it to a handler.
 // The walking order is undetermined.
-func (graph *Graph) walkAll(handler func(*image.Image)) {
-	graph.idIndex.Iterate(func(id string) {
-		if img, err := graph.Get(id); err != nil {
+func (graph *Graph) walkAll(handler func(*image.Image)) error {
+	return graph.walkAllImpl(func(root string, id string) {
+		img, err := graph.Get(id)
+		if err != nil {
 			return
-		} else if handler != nil {
-			handler(img)
 		}
+
+		handler(img)
 	})
 }
 
@@ -430,13 +513,31 @@ func (graph *Graph) Heads() map[string]*image.Image {
 	return heads
 }
 
-func (graph *Graph) imageRoot(id string) string {
-	return filepath.Join(graph.root, id)
+func (graph *Graph) getImageRoot(targetId string) string {
+	var rootPath = ""
+	graph.walkAllImpl(func(root string, id string) {
+		if id == targetId && rootPath == "" {
+			rootPath = root
+		}
+	})
+
+	if rootPath == "" {
+		return ""
+	}
+
+	return filepath.Join(rootPath, targetId)
+}
+
+func (graph *Graph) constructImageRoot(imageId string) string {
+	return filepath.Join(graph.root, imageId)
 }
 
 // loadImage fetches the image with the given id from the graph.
 func (graph *Graph) loadImage(id string) (*image.Image, error) {
-	root := graph.imageRoot(id)
+	root := graph.getImageRoot(id)
+	if root == "" {
+		return nil, fmt.Errorf("could not find image with ID %s", id)
+	}
 
 	// Open the JSON file to decode by streaming
 	jsonSource, err := os.Open(jsonPath(root))
@@ -474,6 +575,8 @@ func (graph *Graph) loadImage(id string) (*image.Image, error) {
 		img.Size = int64(size)
 	}
 
+	img.Root = root
+
 	return img, nil
 }
 
@@ -487,7 +590,7 @@ func (graph *Graph) saveSize(root string, size int) error {
 
 // SetDigest sets the digest for the image layer to the provided value.
 func (graph *Graph) SetDigest(id string, dgst digest.Digest) error {
-	root := graph.imageRoot(id)
+	root := graph.constructImageRoot(id)
 	if err := ioutil.WriteFile(filepath.Join(root, "checksum"), []byte(dgst.String()), 0600); err != nil {
 		return fmt.Errorf("Error storing digest in %s/checksum: %s", root, err)
 	}
@@ -496,7 +599,11 @@ func (graph *Graph) SetDigest(id string, dgst digest.Digest) error {
 
 // GetDigest gets the digest for the provide image layer id.
 func (graph *Graph) GetDigest(id string) (digest.Digest, error) {
-	root := graph.imageRoot(id)
+	root := graph.getImageRoot(id)
+	if root == "" {
+		return "", fmt.Errorf("could not find image with ID %s", id)
+	}
+
 	cs, err := ioutil.ReadFile(filepath.Join(root, "checksum"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -509,7 +616,10 @@ func (graph *Graph) GetDigest(id string) (digest.Digest, error) {
 
 // RawJSON returns the JSON representation for an image as a byte array.
 func (graph *Graph) RawJSON(id string) ([]byte, error) {
-	root := graph.imageRoot(id)
+	root := graph.getImageRoot(id)
+	if root == "" {
+		return nil, fmt.Errorf("could not find image with ID %s", id)
+	}
 
 	buf, err := ioutil.ReadFile(jsonPath(root))
 	if err != nil {
