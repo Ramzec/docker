@@ -74,7 +74,7 @@ func SetupInitLayer(initLayer string) error {
 }
 
 func createRootFilesystemInDriver(graph *Graph, img *image.Image, layerData archive.ArchiveReader) error {
-	if err := graph.driver.Create(img.ID, img.Parent); err != nil {
+	if err := graph.driver.Create(img.ID, img.Parent, true); err != nil {
 		return fmt.Errorf("Driver %s failed to create image rootfs %s: %s", graph.driver, img.ID, err)
 	}
 	return nil

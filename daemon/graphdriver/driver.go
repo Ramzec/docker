@@ -40,7 +40,7 @@ type ProtoDriver interface {
 	String() string
 	// Create creates a new, empty, filesystem layer with the
 	// specified id and parent. Parent may be "".
-	Create(id, parent string) error
+	Create(id, parent string, isImageLayer bool) error
 	// Remove attempts to remove the filesystem layer with this id.
 	Remove(id string) error
 	// Get returns the mountpoint for the layered filesystem referred

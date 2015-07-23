@@ -177,7 +177,7 @@ func (a *Driver) Exists(id string) bool {
 
 // Three folders are created for each id
 // mnt, layers, and diff
-func (a *Driver) Create(id, parent string) error {
+func (a *Driver) Create(id, parent string, isImageLayer bool) error {
 	if err := a.createDirsFor(id); err != nil {
 		return err
 	}

@@ -41,13 +41,13 @@ func createRootFilesystemInDriver(graph *Graph, img *image.Image, layerData arch
 				return fmt.Errorf("Driver %s failed to copy image rootfs %s: %s", graph.driver, img.Container, err)
 			}
 		} else if img.Parent == "" {
-			if err := graph.driver.Create(img.ID, img.Parent); err != nil {
+			if err := graph.driver.Create(img.ID, img.Parent, true); err != nil {
 				return fmt.Errorf("Driver %s failed to create image rootfs %s: %s", graph.driver, img.ID, err)
 			}
 		}
 	} else {
 		// This fallback allows the use of VFS during daemon development.
-		if err := graph.driver.Create(img.ID, img.Parent); err != nil {
+		if err := graph.driver.Create(img.ID, img.Parent, true); err != nil {
 			return fmt.Errorf("Driver %s failed to create image rootfs %s: %s", graph.driver, img.ID, err)
 		}
 	}
