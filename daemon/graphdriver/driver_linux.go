@@ -34,6 +34,7 @@ var (
 		"devicemapper",
 		"overlay",
 		"vfs",
+		"union-federated",
 	}
 
 	FsNames = map[FsMagic]string{
